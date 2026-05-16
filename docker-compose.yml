@@ -1,13 +1,38 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=httpflood
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d httpflood"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   httpflood:
     build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8080:8080"
     restart: unless-stopped
     environment:
       - GO111MODULE=on
-      - HTTPFLOOD_DB=/data/httpflood.sqlite
+      - HTTPFLOOD_DATABASE_URL=postgres://postgres:postgres@postgres:5432/httpflood?sslmode=disable
+      - HTTPFLOOD_SQLITE_MIGRATE_FROM=/data/httpflood.sqlite
+      - HTTPFLOOD_SQLITE_DELETE_AFTER_MIGRATE=true
       - HTTPFLOOD_ADMIN_USER=admin
       - HTTPFLOOD_ADMIN_PASS=Khang0834684568
+      - HTTPFLOOD_MAX_LOGS_PER_RUN=1000
+      - HTTPFLOOD_LOG_FETCH_LIMIT=200
     volumes:
       - ./data:/data
+
+volumes:
+  pgdata:

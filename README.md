@@ -50,15 +50,17 @@ Or anything else of http header. If you don't have any idea of this please just 
 
 ## Docker production setup
 
-A production-ready Docker image is now included.
+A production-ready Docker image is included.
 
 Build the image locally:
 
     docker build -t golang-httpflood .
 
-Run the container:
+Run the container (requires PostgreSQL; pass a DATABASE_URL):
 
-    docker run -p 8080:8080 --name golang-httpflood golang-httpflood
+    docker run -p 8080:8080 --name golang-httpflood \
+      -e HTTPFLOOD_DATABASE_URL='postgres://postgres:postgres@<postgres-host>:5432/httpflood?sslmode=disable' \
+      golang-httpflood
 
 Then open:
 
@@ -70,27 +72,37 @@ If port 8080 is in use, map to another host port:
 
 ## Docker Compose
 
-A `docker-compose.yml` is included for convenience:
+A full stack `docker-compose.yml` is included (`postgres + httpflood`).
+One command to run everything:
 
     docker-compose up --build
 
 This will expose the UI on port 8080 by default.
 
-The web UI stores run state and logs in SQLite. By default the local binary
-uses `httpflood.sqlite` in the working directory. In Docker Compose, the DB is
-stored at `/data/httpflood.sqlite` and mounted to `./data`.
-
 Optional web UI environment variables:
 
-    HTTPFLOOD_DB=/path/to/httpflood.sqlite
+    HTTPFLOOD_DATABASE_URL=postgres://postgres:postgres@postgres:5432/httpflood?sslmode=disable
     HTTPFLOOD_ADDR=:8080
     HTTPFLOOD_ADMIN_USER=admin
     HTTPFLOOD_ADMIN_PASS=admin123
+    HTTPFLOOD_MAX_LOGS_PER_RUN=1000
+    HTTPFLOOD_LOG_FETCH_LIMIT=200
+    HTTPFLOOD_SQLITE_MIGRATE_FROM=/data/httpflood.sqlite
+    HTTPFLOOD_SQLITE_DELETE_AFTER_MIGRATE=true
+
+### SQLite -> PostgreSQL cutover
+
+- Runtime store is now PostgreSQL-only.
+- If `HTTPFLOOD_SQLITE_MIGRATE_FROM` points to an old SQLite file, app will
+  import users, sessions, runs and run_logs into PostgreSQL on startup.
+- If `HTTPFLOOD_SQLITE_DELETE_AFTER_MIGRATE=true`, the source sqlite file
+  (`.sqlite`, `-wal`, `-shm`) is removed after successful import.
+- If PostgreSQL already has data, import is skipped to prevent duplicates.
 
 ## Authentication and account management
 
 - Web UI now requires login (`/login`).
-- On first startup, if no admin exists in SQLite, the app creates exactly one
+- On first startup, if no admin exists in PostgreSQL, the app creates exactly one
   admin account from `HTTPFLOOD_ADMIN_USER` and `HTTPFLOOD_ADMIN_PASS`.
 - Only admin can open `/accounts` to create and manage other accounts.
 - Managed accounts are `member` role only. Admin role is unique and not created
@@ -100,15 +112,22 @@ Optional web UI environment variables:
   - `can_view_monitor`: can view VPS metrics page.
 - Realtime monitor page is available at `/monitor` and updates without full page
   reload.
+- For high-thread runs, log persistence is capped by
+  `HTTPFLOOD_MAX_LOGS_PER_RUN` to keep UI/API responsive.
+- Log polling payload size is controlled by `HTTPFLOOD_LOG_FETCH_LIMIT`.
+- Run controls are available in the UI and API:
+  - `POST /api/runs/{id}/pause`
+  - `POST /api/runs/{id}/resume`
+  - `POST /api/runs/{id}/stop`
+  - `DELETE /api/runs/{id}`
 
 ## VPS deployment
 
-On your VPS, you can deploy from the repo using Docker:
+On your VPS, deploy with full stack (PostgreSQL + app):
 
     git clone <repo-url> golang-httpflood
     cd golang-httpflood
-    docker build -t golang-httpflood .
-    docker run -d -p 8080:8080 --name golang-httpflood golang-httpflood
+    docker compose up -d --build
 
 Then access the service at your VPS public IP on port 8080.
 

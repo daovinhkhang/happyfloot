@@ -70,7 +70,7 @@ type systemMetrics struct {
 
 func (s *runStore) ensureSingleAdmin() error {
 	var adminCount int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE role='admin'`).Scan(&adminCount); err != nil {
+	if err := s.queryRow(`SELECT COUNT(*) FROM users WHERE role='admin'`).Scan(&adminCount); err != nil {
 		return err
 	}
 	if adminCount > 1 {
@@ -93,7 +93,7 @@ func (s *runStore) ensureSingleAdmin() error {
 		return err
 	}
 	now := time.Now().Format(time.RFC3339)
-	_, err = s.db.Exec(
+	_, err = s.exec(
 		`INSERT INTO users (username, password_hash, role, can_start_run, can_view_monitor, is_active, created_at, updated_at)
 		 VALUES (?, ?, 'admin', 1, 1, 1, ?, ?)`,
 		username, string(hash), now, now,
@@ -109,7 +109,7 @@ func (s *runStore) ensureSingleAdmin() error {
 }
 
 func (s *runStore) getUserByUsername(username string) (authUser, string, error) {
-	row := s.db.QueryRow(
+	row := s.queryRow(
 		`SELECT id, username, password_hash, role, can_start_run, can_view_monitor, is_active, created_at, updated_at
 		 FROM users
 		 WHERE username = ?`,
@@ -133,7 +133,7 @@ func (s *runStore) getUserByUsername(username string) (authUser, string, error) 
 }
 
 func (s *runStore) getUserByID(id int64) (authUser, error) {
-	row := s.db.QueryRow(
+	row := s.queryRow(
 		`SELECT id, username, role, can_start_run, can_view_monitor, is_active, created_at, updated_at
 		 FROM users
 		 WHERE id = ?`,
@@ -154,7 +154,7 @@ func (s *runStore) getUserByID(id int64) (authUser, error) {
 }
 
 func (s *runStore) listUsers() ([]authUser, error) {
-	rows, err := s.db.Query(
+	rows, err := s.query(
 		`SELECT id, username, role, can_start_run, can_view_monitor, is_active, created_at, updated_at
 		 FROM users
 		 ORDER BY id ASC`,
@@ -196,10 +196,12 @@ func (s *runStore) createUser(username, password, role string, canStart, canView
 		return authUser{}, err
 	}
 	now := time.Now().Format(time.RFC3339)
-	res, err := s.db.Exec(
+	var id int64
+	err = s.queryRow(
 		`INSERT INTO users (
 			username, password_hash, role, can_start_run, can_view_monitor, is_active, created_at, updated_at, created_by
-		) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+		RETURNING id`,
 		strings.TrimSpace(username),
 		string(hash),
 		role,
@@ -208,11 +210,7 @@ func (s *runStore) createUser(username, password, role string, canStart, canView
 		now,
 		now,
 		createdBy,
-	)
-	if err != nil {
-		return authUser{}, err
-	}
-	id, err := res.LastInsertId()
+	).Scan(&id)
 	if err != nil {
 		return authUser{}, err
 	}
@@ -227,7 +225,7 @@ func (s *runStore) updateUserPermissions(userID int64, canStart, canView, active
 	if user.Role == "admin" {
 		return fmt.Errorf("admin account cannot be modified here")
 	}
-	_, err = s.db.Exec(
+	_, err = s.exec(
 		`UPDATE users
 		 SET can_start_run = ?, can_view_monitor = ?, is_active = ?, updated_at = ?
 		 WHERE id = ?`,
@@ -247,7 +245,7 @@ func (s *runStore) createSession(userID int64) (authSession, error) {
 	}
 	now := time.Now()
 	expires := now.Add(24 * time.Hour)
-	_, err = s.db.Exec(
+	_, err = s.exec(
 		`INSERT INTO sessions (id, user_id, expires_at, created_at, last_seen_at)
 		 VALUES (?, ?, ?, ?, ?)`,
 		token, userID, expires.Format(time.RFC3339), now.Format(time.RFC3339), now.Format(time.RFC3339),
@@ -259,7 +257,7 @@ func (s *runStore) createSession(userID int64) (authSession, error) {
 }
 
 func (s *runStore) getSessionUser(token string) (authUser, error) {
-	row := s.db.QueryRow(
+	row := s.queryRow(
 		`SELECT u.id, u.username, u.role, u.can_start_run, u.can_view_monitor, u.is_active, u.created_at, u.updated_at
 		 FROM sessions sess
 		 JOIN users u ON u.id = sess.user_id
@@ -279,16 +277,16 @@ func (s *runStore) getSessionUser(token string) (authUser, error) {
 	if !user.IsActive {
 		return authUser{}, fmt.Errorf("account is inactive")
 	}
-	_, _ = s.db.Exec(`UPDATE sessions SET last_seen_at = ? WHERE id = ?`, time.Now().Format(time.RFC3339), token)
+	_, _ = s.exec(`UPDATE sessions SET last_seen_at = ? WHERE id = ?`, time.Now().Format(time.RFC3339), token)
 	return user, nil
 }
 
 func (s *runStore) deleteSession(token string) {
-	_, _ = s.db.Exec(`DELETE FROM sessions WHERE id = ?`, token)
+	_, _ = s.exec(`DELETE FROM sessions WHERE id = ?`, token)
 }
 
 func (s *runStore) purgeExpiredSessions() {
-	_, _ = s.db.Exec(`DELETE FROM sessions WHERE expires_at <= ?`, time.Now().Format(time.RFC3339))
+	_, _ = s.exec(`DELETE FROM sessions WHERE expires_at <= ?`, time.Now().Format(time.RFC3339))
 }
 
 func randomToken(size int) (string, error) {

@@ -27,8 +27,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
@@ -89,6 +91,7 @@ var (
 	}
 	pageTemplate = template.Must(template.New("page").Parse(pageHTML))
 	webStore     *runStore
+	runControls  = newRunControlManager()
 )
 
 const pageHTML = `<!DOCTYPE html>
@@ -127,9 +130,13 @@ const pageHTML = `<!DOCTYPE html>
     .run-main span { color:var(--muted); font-size:.78rem; }
     .status { border:1px solid var(--line); border-radius:2px; padding:4px 7px; font-size:.72rem; text-transform:uppercase; white-space:nowrap; }
     .status-running, .status-queued { color:#d7ff9a; border-color:#d7ff9a; }
+    .status-paused, .status-stopping { color:#ffd89a; border-color:#ffd89a; }
     .status-completed { color:#8eff9a; border-color:#8eff9a; }
-    .status-failed, .status-interrupted { color:#ff9b9b; border-color:#b14a4a; }
+    .status-failed, .status-interrupted, .status-stopped { color:#ff9b9b; border-color:#b14a4a; }
     .log-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; color:var(--muted); font-size:.82rem; }
+    .run-actions { display:flex; gap:8px; flex-wrap:wrap; }
+    .run-actions button { border:1px solid var(--line); border-radius:2px; background:#021107; color:var(--text); padding:8px 10px; font:inherit; cursor:pointer; text-transform:none; }
+    .run-actions button:disabled { opacity:.4; cursor:not-allowed; }
     .top-nav { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
     .top-nav a, .top-nav button { border:1px solid var(--line); border-radius:2px; background:#021107; color:var(--text); padding:8px 10px; font:inherit; text-decoration:none; cursor:pointer; }
     .logs { min-height:340px; font-size:.86rem; line-height:1.45; }
@@ -194,6 +201,12 @@ const pageHTML = `<!DOCTYPE html>
         <span id="active-run-label">No run selected</span>
         <span id="poll-state"></span>
       </div>
+      <div class="run-actions">
+        <button id="pause-run" type="button">Pause</button>
+        <button id="resume-run" type="button">Resume</button>
+        <button id="stop-run" type="button">Stop</button>
+        <button id="delete-run" type="button">Delete</button>
+      </div>
       <textarea id="logs" class="logs" readonly></textarea>
     </section>
   </main>
@@ -205,7 +218,12 @@ const pageHTML = `<!DOCTYPE html>
     const logsEl = document.getElementById('logs');
     const activeRunLabel = document.getElementById('active-run-label');
     const pollState = document.getElementById('poll-state');
+    const pauseRunButton = document.getElementById('pause-run');
+    const resumeRunButton = document.getElementById('resume-run');
+    const stopRunButton = document.getElementById('stop-run');
+    const deleteRunButton = document.getElementById('delete-run');
     let activeRunId = null;
+    let activeRunStatus = '';
     let afterLogId = 0;
     let logLines = [];
     let refreshBusy = false;
@@ -233,6 +251,20 @@ const pageHTML = `<!DOCTYPE html>
       afterLogId = 0;
       logLines = [];
       logsEl.value = '';
+    }
+
+    function setRunActionButtons() {
+      if (!activeRunId) {
+        pauseRunButton.disabled = true;
+        resumeRunButton.disabled = true;
+        stopRunButton.disabled = true;
+        deleteRunButton.disabled = true;
+        return;
+      }
+      deleteRunButton.disabled = false;
+      pauseRunButton.disabled = !(activeRunStatus === 'running' || activeRunStatus === 'queued');
+      resumeRunButton.disabled = !(activeRunStatus === 'paused');
+      stopRunButton.disabled = !(activeRunStatus === 'running' || activeRunStatus === 'queued' || activeRunStatus === 'paused' || activeRunStatus === 'stopping');
     }
 
     function statusClass(status) {
@@ -274,6 +306,13 @@ const pageHTML = `<!DOCTYPE html>
         row.append(main, status);
         runsEl.appendChild(row);
       }
+      const selected = runs.find(function (run) { return run.id === activeRunId; });
+      if (selected) {
+        activeRunStatus = selected.status;
+      } else {
+        activeRunStatus = '';
+      }
+      setRunActionButtons();
     }
 
     async function refreshLogs() {
@@ -281,7 +320,7 @@ const pageHTML = `<!DOCTYPE html>
         activeRunLabel.textContent = 'No run selected';
         return;
       }
-      const payload = await api('/api/runs/' + activeRunId + '/logs?after_id=' + afterLogId);
+      const payload = await api('/api/runs/' + activeRunId + '/logs?after_id=' + afterLogId + '&limit=200');
       activeRunLabel.textContent = 'Run #' + activeRunId;
       for (const entry of payload.logs || []) {
         afterLogId = entry.id;
@@ -301,6 +340,7 @@ const pageHTML = `<!DOCTYPE html>
         if (!activeRunId && runs.length) {
           const active = runs.find(function (run) { return run.status === 'running' || run.status === 'queued'; }) || runs[0];
           activeRunId = active.id;
+          activeRunStatus = active.status;
           resetLogs();
         }
         renderRuns(runs);
@@ -320,6 +360,7 @@ const pageHTML = `<!DOCTYPE html>
       try {
         const payload = await api('/api/runs', { method: 'POST', body: new URLSearchParams(new FormData(form)) });
         activeRunId = payload.run.id;
+        activeRunStatus = payload.run.status;
         resetLogs();
         setMessage('Started run #' + activeRunId, false);
         await refreshRuns();
@@ -330,8 +371,57 @@ const pageHTML = `<!DOCTYPE html>
       }
     });
 
+    setRunActionButtons();
     refreshRuns();
-    window.setInterval(refreshRuns, 1500);
+    window.setInterval(refreshRuns, 2000);
+
+    async function runAction(action, method) {
+      if (!activeRunId) return;
+      const path = action === 'delete' ? '/api/runs/' + activeRunId : '/api/runs/' + activeRunId + '/' + action;
+      await api(path, { method: method });
+      if (action === 'delete') {
+        setMessage('Deleted run #' + activeRunId, false);
+        activeRunId = null;
+        activeRunStatus = '';
+        resetLogs();
+      }
+      await refreshRuns();
+    }
+
+    pauseRunButton.addEventListener('click', async function () {
+      try {
+        await runAction('pause', 'POST');
+        setMessage('Paused run #' + activeRunId, false);
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    });
+
+    resumeRunButton.addEventListener('click', async function () {
+      try {
+        await runAction('resume', 'POST');
+        setMessage('Resumed run #' + activeRunId, false);
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    });
+
+    stopRunButton.addEventListener('click', async function () {
+      try {
+        await runAction('stop', 'POST');
+        setMessage('Stopping run #' + activeRunId, false);
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    });
+
+    deleteRunButton.addEventListener('click', async function () {
+      try {
+        await runAction('delete', 'DELETE');
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    });
 
     const logoutButton = document.getElementById('logout-button');
     logoutButton.addEventListener('click', async function () {
@@ -390,10 +480,73 @@ type runLogRecord struct {
 	CreatedAt string `json:"created_at"`
 }
 
+const (
+	runStopReasonNone int32 = iota
+	runStopReasonTimeout
+	runStopReasonStopped
+	runStopReasonDeleted
+)
+
+type runControl struct {
+	done       chan struct{}
+	doneOnce   sync.Once
+	paused     atomic.Bool
+	stopReason atomic.Int32
+}
+
+func newRunControl() *runControl {
+	return &runControl{done: make(chan struct{})}
+}
+
+func (c *runControl) Stop(reason int32) {
+	c.stopReason.Store(reason)
+	c.doneOnce.Do(func() {
+		close(c.done)
+	})
+}
+
+func (c *runControl) Pause() {
+	c.paused.Store(true)
+}
+
+func (c *runControl) Resume() {
+	c.paused.Store(false)
+}
+
+type runControlManager struct {
+	mu    sync.Mutex
+	items map[int64]*runControl
+}
+
+func newRunControlManager() *runControlManager {
+	return &runControlManager{items: make(map[int64]*runControl)}
+}
+
+func (m *runControlManager) Set(runID int64, control *runControl) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.items[runID] = control
+}
+
+func (m *runControlManager) Get(runID int64) (*runControl, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	control, ok := m.items[runID]
+	return control, ok
+}
+
+func (m *runControlManager) Delete(runID int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.items, runID)
+}
+
 type logBuffer struct {
 	mu      sync.Mutex
 	lines   []string
 	console bool
+	keep    bool
+	maxKeep int
 	sink    func(layer, message string)
 }
 
@@ -401,7 +554,12 @@ func (l *logBuffer) Append(layer string, format string, args ...interface{}) {
 	message := fmt.Sprintf(format, args...)
 	msg := fmt.Sprintf("[%s] %s", layer, message)
 	l.mu.Lock()
-	l.lines = append(l.lines, msg)
+	if l.keep {
+		l.lines = append(l.lines, msg)
+		if l.maxKeep > 0 && len(l.lines) > l.maxKeep {
+			l.lines = l.lines[len(l.lines)-l.maxKeep:]
+		}
+	}
 	sink := l.sink
 	l.mu.Unlock()
 	if l.console {
@@ -422,23 +580,36 @@ type runStore struct {
 	db *sql.DB
 }
 
-func openRunStore(path string) (*runStore, error) {
-	if strings.TrimSpace(path) == "" {
-		path = "httpflood.sqlite"
+func rebindQuestionToDollar(query string) string {
+	if !strings.Contains(query, "?") {
+		return query
 	}
-	if path != ":memory:" {
-		dir := filepath.Dir(path)
-		if dir != "." && dir != "" {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return nil, err
-			}
+	var b strings.Builder
+	b.Grow(len(query) + 16)
+	argN := 1
+	for _, ch := range query {
+		if ch == '?' {
+			b.WriteString("$")
+			b.WriteString(strconv.Itoa(argN))
+			argN++
+			continue
 		}
+		b.WriteRune(ch)
 	}
-	db, err := sql.Open("sqlite", path)
+	return b.String()
+}
+
+func openRunStore(databaseURL string) (*runStore, error) {
+	if strings.TrimSpace(databaseURL) == "" {
+		return nil, fmt.Errorf("database URL is required")
+	}
+	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(16)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(30 * time.Minute)
 	store := &runStore{db: db}
 	if err := store.init(); err != nil {
 		db.Close()
@@ -447,13 +618,22 @@ func openRunStore(path string) (*runStore, error) {
 	return store, nil
 }
 
+func (s *runStore) exec(query string, args ...interface{}) (sql.Result, error) {
+	return s.db.Exec(rebindQuestionToDollar(query), args...)
+}
+
+func (s *runStore) query(query string, args ...interface{}) (*sql.Rows, error) {
+	return s.db.Query(rebindQuestionToDollar(query), args...)
+}
+
+func (s *runStore) queryRow(query string, args ...interface{}) *sql.Row {
+	return s.db.QueryRow(rebindQuestionToDollar(query), args...)
+}
+
 func (s *runStore) init() error {
 	for _, query := range []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA busy_timeout=5000",
-		"PRAGMA foreign_keys=ON",
 		`CREATE TABLE IF NOT EXISTS runs (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id BIGSERIAL PRIMARY KEY,
 			target_url TEXT NOT NULL,
 			threads INTEGER NOT NULL,
 			requests_per_conn INTEGER NOT NULL,
@@ -469,29 +649,29 @@ func (s *runStore) init() error {
 			updated_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS run_logs (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			run_id INTEGER NOT NULL,
+			id BIGSERIAL PRIMARY KEY,
+			run_id BIGINT NOT NULL,
 			layer TEXT NOT NULL,
 			message TEXT NOT NULL,
 			created_at TEXT NOT NULL,
 			FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS users (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id BIGSERIAL PRIMARY KEY,
 			username TEXT NOT NULL UNIQUE,
 			password_hash TEXT NOT NULL,
 			role TEXT NOT NULL,
-			can_start_run INTEGER NOT NULL DEFAULT 1,
-			can_view_monitor INTEGER NOT NULL DEFAULT 1,
-			is_active INTEGER NOT NULL DEFAULT 1,
+			can_start_run SMALLINT NOT NULL DEFAULT 1,
+			can_view_monitor SMALLINT NOT NULL DEFAULT 1,
+			is_active SMALLINT NOT NULL DEFAULT 1,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
-			created_by INTEGER,
+			created_by BIGINT,
 			FOREIGN KEY(created_by) REFERENCES users(id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS sessions (
 			id TEXT PRIMARY KEY,
-			user_id INTEGER NOT NULL,
+			user_id BIGINT NOT NULL,
 			expires_at TEXT NOT NULL,
 			created_at TEXT NOT NULL,
 			last_seen_at TEXT NOT NULL,
@@ -503,18 +683,18 @@ func (s *runStore) init() error {
 		"CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)",
 		"CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)",
 	} {
-		if _, err := s.db.Exec(query); err != nil {
+		if _, err := s.exec(query); err != nil {
 			return err
 		}
 	}
 	now := time.Now().Format(time.RFC3339)
-	_, err := s.db.Exec(
+	_, err := s.exec(
 		`UPDATE runs
 		 SET status = 'interrupted',
 		     error = CASE WHEN error = '' THEN ? ELSE error END,
 		     completed_at = ?,
 		     updated_at = ?
-		 WHERE status IN ('queued', 'running')`,
+		 WHERE status IN ('queued', 'running', 'paused', 'stopping')`,
 		"server restarted while this run was active", now, now,
 	)
 	return err
@@ -526,18 +706,16 @@ func (s *runStore) Close() error {
 
 func (s *runStore) CreateRun(req startRunRequest) (runRecord, error) {
 	now := time.Now().Format(time.RFC3339)
-	res, err := s.db.Exec(
+	var id int64
+	err := s.queryRow(
 		`INSERT INTO runs (
 			target_url, threads, requests_per_conn, method, seconds,
 			header_preset, header_text, status, error, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', '', ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', '', ?, ?)
+		RETURNING id`,
 		req.URL, req.Threads, req.RequestsPerConn, req.Method, req.Seconds,
 		req.HeaderPreset, req.HeaderText, now, now,
-	)
-	if err != nil {
-		return runRecord{}, err
-	}
-	id, err := res.LastInsertId()
+	).Scan(&id)
 	if err != nil {
 		return runRecord{}, err
 	}
@@ -546,7 +724,7 @@ func (s *runStore) CreateRun(req startRunRequest) (runRecord, error) {
 
 func (s *runStore) MarkRunStarted(id int64) error {
 	now := time.Now().Format(time.RFC3339)
-	_, err := s.db.Exec(
+	_, err := s.exec(
 		`UPDATE runs SET status = 'running', started_at = ?, updated_at = ?, error = '' WHERE id = ?`,
 		now, now, id,
 	)
@@ -555,15 +733,28 @@ func (s *runStore) MarkRunStarted(id int64) error {
 
 func (s *runStore) FinishRun(id int64, status, message string) error {
 	now := time.Now().Format(time.RFC3339)
-	_, err := s.db.Exec(
+	_, err := s.exec(
 		`UPDATE runs SET status = ?, error = ?, completed_at = ?, updated_at = ? WHERE id = ?`,
 		status, message, now, now, id,
 	)
 	return err
 }
 
+func (s *runStore) SetRunStatus(id int64, status, message string) error {
+	_, err := s.exec(
+		`UPDATE runs SET status = ?, error = ?, updated_at = ? WHERE id = ?`,
+		status, message, time.Now().Format(time.RFC3339), id,
+	)
+	return err
+}
+
+func (s *runStore) DeleteRun(id int64) error {
+	_, err := s.exec(`DELETE FROM runs WHERE id = ?`, id)
+	return err
+}
+
 func (s *runStore) AppendLog(runID int64, layer, message string) error {
-	_, err := s.db.Exec(
+	_, err := s.exec(
 		`INSERT INTO run_logs (run_id, layer, message, created_at) VALUES (?, ?, ?, ?)`,
 		runID, layer, message, time.Now().Format(time.RFC3339Nano),
 	)
@@ -606,7 +797,7 @@ const runSelectColumns = `id, target_url, threads, requests_per_conn, method, se
 	header_preset, header_text, status, error, created_at, started_at, completed_at, updated_at`
 
 func (s *runStore) GetRun(id int64) (runRecord, error) {
-	row := s.db.QueryRow(`SELECT `+runSelectColumns+` FROM runs WHERE id = ?`, id)
+	row := s.queryRow(`SELECT `+runSelectColumns+` FROM runs WHERE id = ?`, id)
 	return scanRunRecord(row.Scan)
 }
 
@@ -614,7 +805,7 @@ func (s *runStore) ListRuns(limit int) ([]runRecord, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	rows, err := s.db.Query(`SELECT `+runSelectColumns+` FROM runs ORDER BY id DESC LIMIT ?`, limit)
+	rows, err := s.query(`SELECT `+runSelectColumns+` FROM runs ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -637,7 +828,7 @@ func (s *runStore) ListLogs(runID, afterID int64, limit int) ([]runLogRecord, er
 	if afterID < 0 {
 		afterID = 0
 	}
-	rows, err := s.db.Query(
+	rows, err := s.query(
 		`SELECT id, run_id, layer, message, created_at
 		 FROM run_logs
 		 WHERE run_id = ? AND id > ?
@@ -910,23 +1101,59 @@ func parseTarget(target string, logger *logBuffer) (string, string, string, stri
 	return runHost, runPort, runPage, runKey, nil
 }
 
-func floodWorker(threadID int, runHost, runPort, runPage, runMode, runKey, headerFile, headerPreset string, requestsPerConn int, ready chan<- int, starter <-chan bool, done <-chan struct{}, logger *logBuffer) {
+func floodWorker(threadID int, runHost, runPort, runPage, runMode, runKey, headerFile, headerPreset string, requestsPerConn int, ready chan<- int, starter <-chan bool, control *runControl, logger *logBuffer) {
 	addr := runHost + ":" + runPort
 	headerPreset = normalizeHeaderPreset(headerPreset, headerFile)
-	logger.Append("build header", "thread=%d mode=%s header=%s preset=%s", threadID, runMode, headerFile, headerPreset)
+	verboseThreadLog := logger.console
+	if verboseThreadLog {
+		logger.Append("build header", "thread=%d mode=%s header=%s preset=%s", threadID, runMode, headerFile, headerPreset)
+	}
 	header, err := buildRequestHeader(runMode, runHost, runPort, runPage, headerFile, headerPreset)
 	if err != nil {
-		logger.Append("build header", "thread=%d error=%v", threadID, err)
+		if verboseThreadLog {
+			logger.Append("build header", "thread=%d error=%v", threadID, err)
+		}
 		ready <- threadID
 		return
 	}
 	ready <- threadID
 	<-starter
-	logger.Append("thread ready", "thread=%d started", threadID)
+	if verboseThreadLog {
+		logger.Append("thread ready", "thread=%d started", threadID)
+	}
+	done := control.done
+	reportAt := time.Now().Add(2 * time.Second)
+	var connectionErrors int
+	var writeErrors int
+	var successfulBatches int
+	var writtenRequests int
 	for {
+		for control.paused.Load() {
+			select {
+			case <-done:
+				if successfulBatches > 0 || writtenRequests > 0 || connectionErrors > 0 || writeErrors > 0 {
+					if verboseThreadLog {
+						logger.Append("progress", "thread=%d batches=%d requests=%d conn_errors=%d write_errors=%d", threadID, successfulBatches, writtenRequests, connectionErrors, writeErrors)
+					}
+				}
+				if verboseThreadLog {
+					logger.Append("stop", "thread=%d stopped while paused", threadID)
+				}
+				return
+			default:
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
 		select {
 		case <-done:
-			logger.Append("stop", "thread=%d stopped", threadID)
+			if successfulBatches > 0 || writtenRequests > 0 || connectionErrors > 0 || writeErrors > 0 {
+				if verboseThreadLog {
+					logger.Append("progress", "thread=%d batches=%d requests=%d conn_errors=%d write_errors=%d", threadID, successfulBatches, writtenRequests, connectionErrors, writeErrors)
+				}
+			}
+			if verboseThreadLog {
+				logger.Append("stop", "thread=%d stopped", threadID)
+			}
 			return
 		default:
 		}
@@ -939,16 +1166,39 @@ func floodWorker(threadID int, runHost, runPort, runPage, runMode, runKey, heade
 			s, err = net.Dial("tcp", addr)
 		}
 		if err != nil {
-			logger.Append("connection", "thread=%d down: %v", threadID, err)
+			connectionErrors++
+			if time.Now().After(reportAt) {
+				if verboseThreadLog {
+					logger.Append("progress", "thread=%d batches=%d requests=%d conn_errors=%d write_errors=%d", threadID, successfulBatches, writtenRequests, connectionErrors, writeErrors)
+				}
+				successfulBatches = 0
+				writtenRequests = 0
+				connectionErrors = 0
+				writeErrors = 0
+				reportAt = time.Now().Add(2 * time.Second)
+			}
 			continue
 		}
-		logger.Append("connection", "thread=%d connected=%s requests_per_conn=%d", threadID, addr, requestsPerConn)
 		written := 0
 		for i := 0; i < requestsPerConn; i++ {
+			for control.paused.Load() {
+				select {
+				case <-done:
+					s.Close()
+					if verboseThreadLog {
+						logger.Append("stop", "thread=%d stopped while paused during write", threadID)
+					}
+					return
+				default:
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
 			select {
 			case <-done:
 				s.Close()
-				logger.Append("stop", "thread=%d stopped during write", threadID)
+				if verboseThreadLog {
+					logger.Append("stop", "thread=%d stopped during write", threadID)
+				}
 				return
 			default:
 			}
@@ -959,20 +1209,30 @@ func floodWorker(threadID int, runHost, runPort, runPage, runMode, runKey, heade
 			}
 			request += header + "\r\n"
 			if _, err := s.Write([]byte(request)); err != nil {
-				logger.Append("write request", "thread=%d request=%d error=%v", threadID, i+1, err)
+				writeErrors++
 				break
-			}
-			if i == 0 {
-				logger.Append("write request", "thread=%d first request written", threadID)
 			}
 			written++
 		}
-		logger.Append("write request", "thread=%d connection batch written=%d", threadID, written)
+		if written > 0 {
+			successfulBatches++
+			writtenRequests += written
+		}
+		if time.Now().After(reportAt) {
+			if verboseThreadLog {
+				logger.Append("progress", "thread=%d batches=%d requests=%d conn_errors=%d write_errors=%d", threadID, successfulBatches, writtenRequests, connectionErrors, writeErrors)
+			}
+			successfulBatches = 0
+			writtenRequests = 0
+			connectionErrors = 0
+			writeErrors = 0
+			reportAt = time.Now().Add(2 * time.Second)
+		}
 		s.Close()
 	}
 }
 
-func runFlood(target string, threads int, requestsPerConn int, runMode string, seconds int, headerFile, headerPreset string, waitForEnter bool, logger *logBuffer) error {
+func runFlood(target string, threads int, requestsPerConn int, runMode string, seconds int, headerFile, headerPreset string, waitForEnter bool, control *runControl, logger *logBuffer) error {
 	if runMode != "get" && runMode != "post" {
 		return fmt.Errorf("wrong mode, only can use get or post")
 	}
@@ -985,6 +1245,12 @@ func runFlood(target string, threads int, requestsPerConn int, runMode string, s
 	if requestsPerConn <= 0 {
 		return fmt.Errorf("requests per connection should be positive")
 	}
+	if control == nil {
+		control = newRunControl()
+	}
+	if control.done == nil {
+		control.done = make(chan struct{})
+	}
 	runHost, runPort, runPage, runKey, err := parseTarget(target, logger)
 	if err != nil {
 		return err
@@ -993,15 +1259,16 @@ func runFlood(target string, threads int, requestsPerConn int, runMode string, s
 	headerPreset = normalizeHeaderPreset(headerPreset, headerFile)
 	logger.Append("prepare threads", "threads=%d requests_per_conn=%d seconds=%d preset=%s", threads, requestsPerConn, seconds, headerPreset)
 	starter := make(chan bool)
-	done := make(chan struct{})
 	ready := make(chan int, threads)
 	for i := 0; i < threads; i++ {
 		time.Sleep(time.Microsecond * 100)
-		go floodWorker(i+1, runHost, runPort, runPage, runMode, runKey, headerFile, headerPreset, requestsPerConn, ready, starter, done, logger)
+		go floodWorker(i+1, runHost, runPort, runPage, runMode, runKey, headerFile, headerPreset, requestsPerConn, ready, starter, control, logger)
 	}
 	for i := 0; i < threads; i++ {
 		threadID := <-ready
-		logger.Append("thread ready", "thread=%d ready", threadID)
+		if logger.console {
+			logger.Append("thread ready", "thread=%d ready", threadID)
+		}
 		if logger.console {
 			fmt.Printf("\rThreads [%.0f] are ready", float64(i+1))
 			os.Stdout.Sync()
@@ -1016,17 +1283,59 @@ func runFlood(target string, threads int, requestsPerConn int, runMode string, s
 	}
 	logger.Append("start", "flood will end in %d seconds", seconds)
 	close(starter)
-	time.Sleep(time.Duration(seconds) * time.Second)
-	close(done)
+	remaining := time.Duration(seconds) * time.Second
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	nextHeartbeat := time.Now().Add(5 * time.Second)
+	for remaining > 0 {
+		select {
+		case <-control.done:
+			switch control.stopReason.Load() {
+			case runStopReasonStopped:
+				logger.Append("stop", "flood stopped by user")
+			case runStopReasonDeleted:
+				logger.Append("stop", "flood stopped by delete request")
+			default:
+				logger.Append("stop", "flood interrupted")
+			}
+			return nil
+		case <-ticker.C:
+			if control.paused.Load() {
+				continue
+			}
+			remaining -= 200 * time.Millisecond
+			if time.Now().After(nextHeartbeat) {
+				remainingSec := int((remaining + time.Second - 1) / time.Second)
+				if remainingSec < 0 {
+					remainingSec = 0
+				}
+				logger.Append("heartbeat", "running remaining=%ds", remainingSec)
+				nextHeartbeat = time.Now().Add(5 * time.Second)
+			}
+		}
+	}
+	control.Stop(runStopReasonTimeout)
 	logger.Append("stop", "flood completed")
 	return nil
 }
 
-func webDBPath() string {
-	if value := strings.TrimSpace(os.Getenv("HTTPFLOOD_DB")); value != "" {
+func webDatabaseURL() string {
+	if value := strings.TrimSpace(os.Getenv("HTTPFLOOD_DATABASE_URL")); value != "" {
 		return value
 	}
-	return "httpflood.sqlite"
+	if legacy := strings.TrimSpace(os.Getenv("HTTPFLOOD_DB")); strings.HasPrefix(legacy, "postgres://") || strings.HasPrefix(legacy, "postgresql://") {
+		return legacy
+	}
+	return "postgres://postgres:postgres@localhost:5432/httpflood?sslmode=disable"
+}
+
+func webSQLiteMigrateFrom() string {
+	return strings.TrimSpace(os.Getenv("HTTPFLOOD_SQLITE_MIGRATE_FROM"))
+}
+
+func webSQLiteDeleteAfterMigrate() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("HTTPFLOOD_SQLITE_DELETE_AFTER_MIGRATE")))
+	return value == "1" || value == "true" || value == "yes"
 }
 
 func webListenAddr() string {
@@ -1036,14 +1345,56 @@ func webListenAddr() string {
 	return ":8080"
 }
 
+func webMaxLogsPerRun() int64 {
+	value := strings.TrimSpace(os.Getenv("HTTPFLOOD_MAX_LOGS_PER_RUN"))
+	if value == "" {
+		return 1000
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 {
+		return 1000
+	}
+	return parsed
+}
+
+func webLogsFetchLimit() int {
+	value := strings.TrimSpace(os.Getenv("HTTPFLOOD_LOG_FETCH_LIMIT"))
+	if value == "" {
+		return 200
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return 200
+	}
+	if parsed > 500 {
+		return 500
+	}
+	return parsed
+}
+
+func isRunTerminal(status string) bool {
+	switch status {
+	case "completed", "failed", "stopped", "interrupted":
+		return true
+	default:
+		return false
+	}
+}
+
 func startWebServer() {
-	store, err := openRunStore(webDBPath())
+	store, err := openRunStore(webDatabaseURL())
 	if err != nil {
-		fmt.Println("Failed to open SQLite store:", err)
+		fmt.Println("Failed to open PostgreSQL store:", err)
 		return
 	}
 	defer store.Close()
 	webStore = store
+	if sqlitePath := webSQLiteMigrateFrom(); sqlitePath != "" {
+		if err := webStore.ImportFromSQLite(sqlitePath, webSQLiteDeleteAfterMigrate()); err != nil {
+			fmt.Println("Failed to migrate SQLite data:", err)
+			return
+		}
+	}
 	if err := webStore.ensureSingleAdmin(); err != nil {
 		fmt.Println("Failed to initialize admin account:", err)
 		return
@@ -1066,7 +1417,7 @@ func startWebServer() {
 
 	listenAddr := webListenAddr()
 	fmt.Println("Starting httpflood UI on", listenAddr)
-	fmt.Println("SQLite store:", webDBPath())
+	fmt.Println("PostgreSQL store: configured")
 	if err := http.ListenAndServe(listenAddr, mux); err != nil {
 		fmt.Println("Failed to start UI:", err)
 	}
@@ -1086,7 +1437,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 
 func handleRuns(w http.ResponseWriter, r *http.Request) {
 	if webStore == nil {
-		writeJSONError(w, http.StatusServiceUnavailable, "SQLite store is not ready")
+		writeJSONError(w, http.StatusServiceUnavailable, "database store is not ready")
 		return
 	}
 	user, ok := requireAuthAPI(w, r)
@@ -1116,7 +1467,9 @@ func handleRuns(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		go executeStoredRun(run)
+		control := newRunControl()
+		runControls.Set(run.ID, control)
+		go executeStoredRun(run, control)
 		writeJSON(w, http.StatusAccepted, map[string]interface{}{"run": run})
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -1126,10 +1479,11 @@ func handleRuns(w http.ResponseWriter, r *http.Request) {
 
 func handleRunResource(w http.ResponseWriter, r *http.Request) {
 	if webStore == nil {
-		writeJSONError(w, http.StatusServiceUnavailable, "SQLite store is not ready")
+		writeJSONError(w, http.StatusServiceUnavailable, "database store is not ready")
 		return
 	}
-	if _, ok := requireAuthAPI(w, r); !ok {
+	user, ok := requireAuthAPI(w, r)
+	if !ok {
 		return
 	}
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/runs/"), "/")
@@ -1156,9 +1510,95 @@ func handleRunResource(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"run": run})
 		return
 	}
+	if len(parts) == 1 && r.Method == http.MethodDelete {
+		if !user.CanStartRun && !isAdmin(user) {
+			writeJSONError(w, http.StatusForbidden, "run control denied by account permission")
+			return
+		}
+		run, err := webStore.GetRun(runID)
+		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if control, exists := runControls.Get(runID); exists {
+			control.Stop(runStopReasonDeleted)
+		}
+		if err := webStore.DeleteRun(runID); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		runControls.Delete(runID)
+		writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": run.ID})
+		return
+	}
+	if len(parts) == 2 && r.Method == http.MethodPost {
+		if !user.CanStartRun && !isAdmin(user) {
+			writeJSONError(w, http.StatusForbidden, "run control denied by account permission")
+			return
+		}
+		action := parts[1]
+		run, err := webStore.GetRun(runID)
+		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		control, exists := runControls.Get(runID)
+		if !exists || isRunTerminal(run.Status) {
+			writeJSONError(w, http.StatusConflict, "run is not active")
+			return
+		}
+		switch action {
+		case "pause":
+			control.Pause()
+			if err := webStore.SetRunStatus(runID, "paused", ""); err != nil {
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"run_id": runID, "status": "paused"})
+			return
+		case "resume":
+			control.Resume()
+			if err := webStore.SetRunStatus(runID, "running", ""); err != nil {
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"run_id": runID, "status": "running"})
+			return
+		case "stop":
+			control.Resume()
+			control.Stop(runStopReasonStopped)
+			if err := webStore.SetRunStatus(runID, "stopping", "stopping by user"); err != nil {
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"run_id": runID, "status": "stopping"})
+			return
+		default:
+			http.NotFound(w, r)
+			return
+		}
+	}
 	if len(parts) == 2 && parts[1] == "logs" && r.Method == http.MethodGet {
 		afterID, _ := strconv.ParseInt(r.URL.Query().Get("after_id"), 10, 64)
-		logs, err := webStore.ListLogs(runID, afterID, 500)
+		limit := webLogsFetchLimit()
+		if q := strings.TrimSpace(r.URL.Query().Get("limit")); q != "" {
+			if parsed, err := strconv.Atoi(q); err == nil && parsed > 0 {
+				if parsed > 500 {
+					limit = 500
+				} else {
+					limit = parsed
+				}
+			}
+		}
+		logs, err := webStore.ListLogs(runID, afterID, limit)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -1231,7 +1671,7 @@ func parsePositiveFormInt(r *http.Request, name string, fallback int) (int, erro
 	return parsed, nil
 }
 
-func executeStoredRun(run runRecord) {
+func executeStoredRun(run runRecord, control *runControl) {
 	req := startRunRequest{
 		URL:             run.TargetURL,
 		Threads:         run.Threads,
@@ -1243,13 +1683,33 @@ func executeStoredRun(run runRecord) {
 	}
 	if err := webStore.MarkRunStarted(run.ID); err != nil {
 		fmt.Println("Failed to mark run started:", err)
+		runControls.Delete(run.ID)
 		return
 	}
+	defer runControls.Delete(run.ID)
+
+	maxLogs := webMaxLogsPerRun()
+	var persistedLogs atomic.Int64
+	var droppedLogs atomic.Int64
 	logger := &logBuffer{
+		keep:    false,
+		maxKeep: 0,
 		sink: func(layer, message string) {
-			if err := webStore.AppendLog(run.ID, layer, message); err != nil {
-				fmt.Println("Failed to persist log:", err)
+			if control.stopReason.Load() == runStopReasonDeleted {
+				return
 			}
+			if persistedLogs.Load() >= maxLogs {
+				droppedLogs.Add(1)
+				return
+			}
+			if err := webStore.AppendLog(run.ID, layer, message); err != nil {
+				if control.stopReason.Load() == runStopReasonDeleted || strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+					return
+				}
+				fmt.Println("Failed to persist log:", err)
+				return
+			}
+			persistedLogs.Add(1)
 		},
 	}
 	logger.Append("run", "run=%d target=%s threads=%d requests_per_conn=%d seconds=%d", run.ID, req.URL, req.Threads, req.RequestsPerConn, req.Seconds)
@@ -1267,10 +1727,23 @@ func executeStoredRun(run runRecord) {
 	}
 	req.HeaderPreset = normalizeHeaderPreset(req.HeaderPreset, headerFile)
 
-	if err := runFlood(req.URL, req.Threads, req.RequestsPerConn, req.Method, req.Seconds, headerFile, req.HeaderPreset, false, logger); err != nil {
+	if err := runFlood(req.URL, req.Threads, req.RequestsPerConn, req.Method, req.Seconds, headerFile, req.HeaderPreset, false, control, logger); err != nil {
+		if droppedLogs.Load() > 0 {
+			_ = webStore.AppendLog(run.ID, "log", fmt.Sprintf("dropped_logs=%d due to HTTPFLOOD_MAX_LOGS_PER_RUN=%d", droppedLogs.Load(), maxLogs))
+		}
 		logger.Append("run", "failed: %v", err)
 		_ = webStore.FinishRun(run.ID, "failed", err.Error())
 		return
+	}
+	if control.stopReason.Load() == runStopReasonStopped {
+		_ = webStore.FinishRun(run.ID, "stopped", "stopped by user")
+		return
+	}
+	if control.stopReason.Load() == runStopReasonDeleted {
+		return
+	}
+	if droppedLogs.Load() > 0 {
+		_ = webStore.AppendLog(run.ID, "log", fmt.Sprintf("dropped_logs=%d due to HTTPFLOOD_MAX_LOGS_PER_RUN=%d", droppedLogs.Load(), maxLogs))
 	}
 	logger.Append("run", "completed")
 	_ = webStore.FinishRun(run.ID, "completed", "")
@@ -1328,12 +1801,12 @@ func main() {
 		fmt.Println("limit should be a integer")
 		return
 	}
-	logger := &logBuffer{console: true}
+	logger := &logBuffer{console: true, keep: true, maxKeep: 10000}
 	cliPreset := "default"
 	if os.Args[5] != "nil" {
 		cliPreset = "custom"
 	}
-	if err := runFlood(os.Args[1], threads, 100, os.Args[3], limit, os.Args[5], cliPreset, true, logger); err != nil {
+	if err := runFlood(os.Args[1], threads, 100, os.Args[3], limit, os.Args[5], cliPreset, true, nil, logger); err != nil {
 		fmt.Println("Error:", err)
 		os.Exit(1)
 	}
