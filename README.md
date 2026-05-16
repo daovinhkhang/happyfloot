@@ -76,6 +76,15 @@ A `docker-compose.yml` is included for convenience:
 
 This will expose the UI on port 8080 by default.
 
+The web UI stores run state and logs in SQLite. By default the local binary
+uses `httpflood.sqlite` in the working directory. In Docker Compose, the DB is
+stored at `/data/httpflood.sqlite` and mounted to `./data`.
+
+Optional web UI environment variables:
+
+    HTTPFLOOD_DB=/path/to/httpflood.sqlite
+    HTTPFLOOD_ADDR=:8080
+
 ## VPS deployment
 
 On your VPS, you can deploy from the repo using Docker:

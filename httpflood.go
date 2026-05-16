@@ -13,6 +13,8 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -26,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 var (
@@ -84,6 +88,7 @@ var (
 		"https://play.google.com/store/search?q=",
 	}
 	pageTemplate = template.Must(template.New("page").Parse(pageHTML))
+	webStore     *runStore
 )
 
 const pageHTML = `<!DOCTYPE html>
@@ -110,10 +115,23 @@ const pageHTML = `<!DOCTYPE html>
     input:focus, select:focus, textarea:focus { outline:0; border-color:#b8ff9a; box-shadow:0 0 0 3px rgba(110,255,130,.16); }
     textarea { min-height:110px; resize:vertical; }
     button { border:0; border-radius:2px; background:var(--accent); color:#041307; padding:10px 14px; font:inherit; font-weight:700; text-transform:uppercase; cursor:pointer; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
     .message { border:1px solid var(--line); background:#021007; padding:10px; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .message:empty { display:none; }
     .message.error { border-color:var(--danger); color:#ff9b9b; }
+    .runs { display:grid; gap:8px; }
+    .run-row { width:100%; display:flex; align-items:center; justify-content:space-between; gap:12px; border:1px solid var(--line); border-radius:3px; background:#020b04; color:var(--text); padding:10px; text-align:left; text-transform:none; }
+    .run-row.active { border-color:#b8ff9a; box-shadow:0 0 0 3px rgba(110,255,130,.12); }
+    .run-main { display:grid; gap:5px; min-width:0; }
+    .run-main strong, .run-main span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .run-main span { color:var(--muted); font-size:.78rem; }
+    .status { border:1px solid var(--line); border-radius:2px; padding:4px 7px; font-size:.72rem; text-transform:uppercase; white-space:nowrap; }
+    .status-running, .status-queued { color:#d7ff9a; border-color:#d7ff9a; }
+    .status-completed { color:#8eff9a; border-color:#8eff9a; }
+    .status-failed, .status-interrupted { color:#ff9b9b; border-color:#b14a4a; }
+    .log-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; color:var(--muted); font-size:.82rem; }
     .logs { min-height:340px; font-size:.86rem; line-height:1.45; }
-    @media (max-width:720px) { .grid { grid-template-columns:1fr; } body { padding:8px; } .card { padding:10px; } .logs { min-height:240px; } }
+    @media (max-width:720px) { .grid { grid-template-columns:1fr; } body { padding:8px; } .card { padding:10px; } .logs { min-height:240px; } .run-row { align-items:flex-start; flex-direction:column; } }
   </style>
 </head>
 <body>
@@ -124,9 +142,8 @@ const pageHTML = `<!DOCTYPE html>
     </section>
     <section class="card">
       <h2>Start</h2>
-      {{if .Error}}<div class="message error">{{.Error}}</div>{{end}}
-      {{if .Result}}<div class="message">{{.Result}}</div>{{end}}
-      <form method="post">
+      <div id="message" class="message"></div>
+      <form id="start-form">
         <div class="grid">
           <label>Target URL
             <input name="url" type="text" value="{{.URL}}" placeholder="http://127.0.0.1:8080/" required>
@@ -157,14 +174,158 @@ const pageHTML = `<!DOCTYPE html>
         <label>Custom Header Text (leave empty for nil)
           <textarea name="headers" placeholder="User-Agent: Example&#10;Accept: text/html">{{.HeaderText}}</textarea>
         </label>
-        <button type="submit">Start Flood</button>
+        <button id="start-button" type="submit">Start Run</button>
       </form>
     </section>
     <section class="card">
-      <h2>Layer Logs</h2>
-      <textarea class="logs" readonly>{{.Logs}}</textarea>
+      <h2>Runs</h2>
+      <div id="runs" class="runs"></div>
+    </section>
+    <section class="card">
+      <h2>Run Logs</h2>
+      <div class="log-head">
+        <span id="active-run-label">No run selected</span>
+        <span id="poll-state"></span>
+      </div>
+      <textarea id="logs" class="logs" readonly></textarea>
     </section>
   </main>
+  <script>
+    const form = document.getElementById('start-form');
+    const startButton = document.getElementById('start-button');
+    const message = document.getElementById('message');
+    const runsEl = document.getElementById('runs');
+    const logsEl = document.getElementById('logs');
+    const activeRunLabel = document.getElementById('active-run-label');
+    const pollState = document.getElementById('poll-state');
+    let activeRunId = null;
+    let afterLogId = 0;
+    let logLines = [];
+    let refreshBusy = false;
+
+    function setMessage(text, isError) {
+      message.textContent = text || '';
+      message.className = isError ? 'message error' : 'message';
+    }
+
+    function formatDate(value) {
+      if (!value) return '-';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleString();
+    }
+
+    async function api(path, options) {
+      const response = await fetch(path, options);
+      const payload = await response.json().catch(function () { return {}; });
+      if (!response.ok) throw new Error(payload.error || response.statusText);
+      return payload;
+    }
+
+    function resetLogs() {
+      afterLogId = 0;
+      logLines = [];
+      logsEl.value = '';
+    }
+
+    function statusClass(status) {
+      return 'status status-' + status;
+    }
+
+    function renderRuns(runs) {
+      runsEl.replaceChildren();
+      if (!runs.length) {
+        const empty = document.createElement('p');
+        empty.textContent = 'No runs yet';
+        runsEl.appendChild(empty);
+        return;
+      }
+      for (const run of runs) {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'run-row' + (run.id === activeRunId ? ' active' : '');
+        row.addEventListener('click', function () {
+          if (activeRunId !== run.id) {
+            activeRunId = run.id;
+            resetLogs();
+            refreshLogs();
+            renderRuns(runs);
+          }
+        });
+
+        const main = document.createElement('span');
+        main.className = 'run-main';
+        const title = document.createElement('strong');
+        title.textContent = '#' + run.id + ' ' + run.method.toUpperCase() + ' ' + run.target_url;
+        const meta = document.createElement('span');
+        meta.textContent = run.threads + ' threads | ' + run.requests_per_conn + ' req/conn | ' + run.seconds + 's | ' + formatDate(run.created_at);
+        main.append(title, meta);
+
+        const status = document.createElement('span');
+        status.className = statusClass(run.status);
+        status.textContent = run.status;
+        row.append(main, status);
+        runsEl.appendChild(row);
+      }
+    }
+
+    async function refreshLogs() {
+      if (!activeRunId) {
+        activeRunLabel.textContent = 'No run selected';
+        return;
+      }
+      const payload = await api('/api/runs/' + activeRunId + '/logs?after_id=' + afterLogId);
+      activeRunLabel.textContent = 'Run #' + activeRunId;
+      for (const entry of payload.logs || []) {
+        afterLogId = entry.id;
+        logLines.push('[' + formatDate(entry.created_at) + '] [' + entry.layer + '] ' + entry.message);
+      }
+      if (logLines.length > 1000) logLines = logLines.slice(-1000);
+      logsEl.value = logLines.join('\n');
+      logsEl.scrollTop = logsEl.scrollHeight;
+    }
+
+    async function refreshRuns() {
+      if (refreshBusy) return;
+      refreshBusy = true;
+      try {
+        const payload = await api('/api/runs');
+        const runs = payload.runs || [];
+        if (!activeRunId && runs.length) {
+          const active = runs.find(function (run) { return run.status === 'running' || run.status === 'queued'; }) || runs[0];
+          activeRunId = active.id;
+          resetLogs();
+        }
+        renderRuns(runs);
+        if (activeRunId) await refreshLogs();
+        pollState.textContent = 'Updated ' + new Date().toLocaleTimeString();
+      } catch (error) {
+        pollState.textContent = 'Poll error';
+      } finally {
+        refreshBusy = false;
+      }
+    }
+
+    form.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      startButton.disabled = true;
+      setMessage('Starting run...', false);
+      try {
+        const payload = await api('/api/runs', { method: 'POST', body: new FormData(form) });
+        activeRunId = payload.run.id;
+        resetLogs();
+        setMessage('Started run #' + activeRunId, false);
+        await refreshRuns();
+      } catch (error) {
+        setMessage(error.message, true);
+      } finally {
+        startButton.disabled = false;
+      }
+    });
+
+    refreshRuns();
+    window.setInterval(refreshRuns, 1500);
+  </script>
 </body>
 </html>`
 
@@ -181,19 +342,60 @@ type pageData struct {
 	Logs            string
 }
 
+type startRunRequest struct {
+	URL             string `json:"url"`
+	Threads         int    `json:"threads"`
+	RequestsPerConn int    `json:"requests_per_conn"`
+	Method          string `json:"method"`
+	Seconds         int    `json:"seconds"`
+	HeaderPreset    string `json:"header_preset"`
+	HeaderText      string `json:"header_text"`
+}
+
+type runRecord struct {
+	ID              int64  `json:"id"`
+	TargetURL       string `json:"target_url"`
+	Threads         int    `json:"threads"`
+	RequestsPerConn int    `json:"requests_per_conn"`
+	Method          string `json:"method"`
+	Seconds         int    `json:"seconds"`
+	HeaderPreset    string `json:"header_preset"`
+	HeaderText      string `json:"header_text"`
+	Status          string `json:"status"`
+	Error           string `json:"error"`
+	CreatedAt       string `json:"created_at"`
+	StartedAt       string `json:"started_at,omitempty"`
+	CompletedAt     string `json:"completed_at,omitempty"`
+	UpdatedAt       string `json:"updated_at"`
+}
+
+type runLogRecord struct {
+	ID        int64  `json:"id"`
+	RunID     int64  `json:"run_id"`
+	Layer     string `json:"layer"`
+	Message   string `json:"message"`
+	CreatedAt string `json:"created_at"`
+}
+
 type logBuffer struct {
 	mu      sync.Mutex
 	lines   []string
 	console bool
+	sink    func(layer, message string)
 }
 
 func (l *logBuffer) Append(layer string, format string, args ...interface{}) {
-	msg := fmt.Sprintf("[%s] %s", layer, fmt.Sprintf(format, args...))
+	message := fmt.Sprintf(format, args...)
+	msg := fmt.Sprintf("[%s] %s", layer, message)
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.lines = append(l.lines, msg)
+	sink := l.sink
+	l.mu.Unlock()
 	if l.console {
 		fmt.Println(msg)
+	}
+	if sink != nil {
+		sink(layer, message)
 	}
 }
 
@@ -201,6 +403,224 @@ func (l *logBuffer) String() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return strings.Join(l.lines, "\n")
+}
+
+type runStore struct {
+	db *sql.DB
+}
+
+func openRunStore(path string) (*runStore, error) {
+	if strings.TrimSpace(path) == "" {
+		path = "httpflood.sqlite"
+	}
+	if path != ":memory:" {
+		dir := filepath.Dir(path)
+		if dir != "." && dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return nil, err
+			}
+		}
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	store := &runStore{db: db}
+	if err := store.init(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+func (s *runStore) init() error {
+	for _, query := range []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA busy_timeout=5000",
+		"PRAGMA foreign_keys=ON",
+		`CREATE TABLE IF NOT EXISTS runs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			target_url TEXT NOT NULL,
+			threads INTEGER NOT NULL,
+			requests_per_conn INTEGER NOT NULL,
+			method TEXT NOT NULL,
+			seconds INTEGER NOT NULL,
+			header_preset TEXT NOT NULL,
+			header_text TEXT NOT NULL,
+			status TEXT NOT NULL,
+			error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			started_at TEXT,
+			completed_at TEXT,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS run_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id INTEGER NOT NULL,
+			layer TEXT NOT NULL,
+			message TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
+		)`,
+		"CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)",
+		"CREATE INDEX IF NOT EXISTS idx_run_logs_run_id_id ON run_logs(run_id, id)",
+	} {
+		if _, err := s.db.Exec(query); err != nil {
+			return err
+		}
+	}
+	now := time.Now().Format(time.RFC3339)
+	_, err := s.db.Exec(
+		`UPDATE runs
+		 SET status = 'interrupted',
+		     error = CASE WHEN error = '' THEN ? ELSE error END,
+		     completed_at = ?,
+		     updated_at = ?
+		 WHERE status IN ('queued', 'running')`,
+		"server restarted while this run was active", now, now,
+	)
+	return err
+}
+
+func (s *runStore) Close() error {
+	return s.db.Close()
+}
+
+func (s *runStore) CreateRun(req startRunRequest) (runRecord, error) {
+	now := time.Now().Format(time.RFC3339)
+	res, err := s.db.Exec(
+		`INSERT INTO runs (
+			target_url, threads, requests_per_conn, method, seconds,
+			header_preset, header_text, status, error, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', '', ?, ?)`,
+		req.URL, req.Threads, req.RequestsPerConn, req.Method, req.Seconds,
+		req.HeaderPreset, req.HeaderText, now, now,
+	)
+	if err != nil {
+		return runRecord{}, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return runRecord{}, err
+	}
+	return s.GetRun(id)
+}
+
+func (s *runStore) MarkRunStarted(id int64) error {
+	now := time.Now().Format(time.RFC3339)
+	_, err := s.db.Exec(
+		`UPDATE runs SET status = 'running', started_at = ?, updated_at = ?, error = '' WHERE id = ?`,
+		now, now, id,
+	)
+	return err
+}
+
+func (s *runStore) FinishRun(id int64, status, message string) error {
+	now := time.Now().Format(time.RFC3339)
+	_, err := s.db.Exec(
+		`UPDATE runs SET status = ?, error = ?, completed_at = ?, updated_at = ? WHERE id = ?`,
+		status, message, now, now, id,
+	)
+	return err
+}
+
+func (s *runStore) AppendLog(runID int64, layer, message string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO run_logs (run_id, layer, message, created_at) VALUES (?, ?, ?, ?)`,
+		runID, layer, message, time.Now().Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+func scanRunRecord(scan func(dest ...interface{}) error) (runRecord, error) {
+	var run runRecord
+	var startedAt sql.NullString
+	var completedAt sql.NullString
+	err := scan(
+		&run.ID,
+		&run.TargetURL,
+		&run.Threads,
+		&run.RequestsPerConn,
+		&run.Method,
+		&run.Seconds,
+		&run.HeaderPreset,
+		&run.HeaderText,
+		&run.Status,
+		&run.Error,
+		&run.CreatedAt,
+		&startedAt,
+		&completedAt,
+		&run.UpdatedAt,
+	)
+	if err != nil {
+		return runRecord{}, err
+	}
+	if startedAt.Valid {
+		run.StartedAt = startedAt.String
+	}
+	if completedAt.Valid {
+		run.CompletedAt = completedAt.String
+	}
+	return run, nil
+}
+
+const runSelectColumns = `id, target_url, threads, requests_per_conn, method, seconds,
+	header_preset, header_text, status, error, created_at, started_at, completed_at, updated_at`
+
+func (s *runStore) GetRun(id int64) (runRecord, error) {
+	row := s.db.QueryRow(`SELECT `+runSelectColumns+` FROM runs WHERE id = ?`, id)
+	return scanRunRecord(row.Scan)
+}
+
+func (s *runStore) ListRuns(limit int) ([]runRecord, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`SELECT `+runSelectColumns+` FROM runs ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	runs := make([]runRecord, 0)
+	for rows.Next() {
+		run, err := scanRunRecord(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
+func (s *runStore) ListLogs(runID, afterID int64, limit int) ([]runLogRecord, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 500
+	}
+	if afterID < 0 {
+		afterID = 0
+	}
+	rows, err := s.db.Query(
+		`SELECT id, run_id, layer, message, created_at
+		 FROM run_logs
+		 WHERE run_id = ? AND id > ?
+		 ORDER BY id ASC
+		 LIMIT ?`,
+		runID, afterID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	logs := make([]runLogRecord, 0)
+	for rows.Next() {
+		var log runLogRecord
+		if err := rows.Scan(&log.ID, &log.RunID, &log.Layer, &log.Message, &log.CreatedAt); err != nil {
+			return nil, err
+		}
+		logs = append(logs, log)
+	}
+	return logs, rows.Err()
 }
 
 func init() {
@@ -565,55 +985,234 @@ func runFlood(target string, threads int, requestsPerConn int, runMode string, s
 	return nil
 }
 
+func webDBPath() string {
+	if value := strings.TrimSpace(os.Getenv("HTTPFLOOD_DB")); value != "" {
+		return value
+	}
+	return "httpflood.sqlite"
+}
+
+func webListenAddr() string {
+	if value := strings.TrimSpace(os.Getenv("HTTPFLOOD_ADDR")); value != "" {
+		return value
+	}
+	return ":8080"
+}
+
 func startWebServer() {
-	http.HandleFunc("/", handleIndex)
-	fmt.Println("Starting httpflood UI on http://0.0.0.0:8080/")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	store, err := openRunStore(webDBPath())
+	if err != nil {
+		fmt.Println("Failed to open SQLite store:", err)
+		return
+	}
+	defer store.Close()
+	webStore = store
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleIndex)
+	mux.HandleFunc("/api/runs", handleRuns)
+	mux.HandleFunc("/api/runs/", handleRunResource)
+
+	listenAddr := webListenAddr()
+	fmt.Println("Starting httpflood UI on", listenAddr)
+	fmt.Println("SQLite store:", webDBPath())
+	if err := http.ListenAndServe(listenAddr, mux); err != nil {
 		fmt.Println("Failed to start UI:", err)
 	}
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
 	data := pageData{Method: "get", HeaderPreset: "default"}
-	if r.Method == http.MethodPost {
-		if err := r.ParseForm(); err != nil {
-			data.Error = err.Error()
-			renderPage(w, data)
+	renderPage(w, data)
+}
+
+func handleRuns(w http.ResponseWriter, r *http.Request) {
+	if webStore == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "SQLite store is not ready")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		runs, err := webStore.ListRuns(50)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		data.URL = r.FormValue("url")
-		data.Method = r.FormValue("method")
-		data.Threads, _ = strconv.Atoi(r.FormValue("threads"))
-		data.RequestsPerConn, _ = strconv.Atoi(r.FormValue("requests_per_conn"))
-		if data.RequestsPerConn == 0 {
-			data.RequestsPerConn = 100
+		writeJSON(w, http.StatusOK, map[string]interface{}{"runs": runs})
+	case http.MethodPost:
+		req, err := parseStartRunRequest(r)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
 		}
-		data.Seconds, _ = strconv.Atoi(r.FormValue("seconds"))
-		data.HeaderPreset = r.FormValue("header_preset")
-		data.HeaderText = r.FormValue("headers")
-
-		headerFile := "nil"
-		if strings.TrimSpace(data.HeaderText) != "" {
-			tmpName := filepath.Join(os.TempDir(), fmt.Sprintf("httpflood-header-%d.txt", time.Now().UnixNano()))
-			if err := os.WriteFile(tmpName, []byte(data.HeaderText), 0o600); err != nil {
-				data.Error = fmt.Sprintf("unable to save headers: %v", err)
-				renderPage(w, data)
-				return
-			}
-			defer os.Remove(tmpName)
-			headerFile = tmpName
+		run, err := webStore.CreateRun(req)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
-		data.HeaderPreset = normalizeHeaderPreset(data.HeaderPreset, headerFile)
-
-		logger := &logBuffer{}
-		if err := runFlood(data.URL, data.Threads, data.RequestsPerConn, data.Method, data.Seconds, headerFile, data.HeaderPreset, false, logger); err != nil {
-			data.Error = err.Error()
-		} else {
-			data.Result = "completed"
-		}
-		data.Logs = logger.String()
+		go executeStoredRun(run)
+		writeJSON(w, http.StatusAccepted, map[string]interface{}{"run": run})
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
-	renderPage(w, data)
+}
+
+func handleRunResource(w http.ResponseWriter, r *http.Request) {
+	if webStore == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "SQLite store is not ready")
+		return
+	}
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/runs/"), "/")
+	parts := strings.Split(rest, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	runID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || runID <= 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid run id")
+		return
+	}
+	if len(parts) == 1 && r.Method == http.MethodGet {
+		run, err := webStore.GetRun(runID)
+		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"run": run})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "logs" && r.Method == http.MethodGet {
+		afterID, _ := strconv.ParseInt(r.URL.Query().Get("after_id"), 10, 64)
+		logs, err := webStore.ListLogs(runID, afterID, 500)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"logs": logs})
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func parseStartRunRequest(r *http.Request) (startRunRequest, error) {
+	if err := r.ParseForm(); err != nil {
+		return startRunRequest{}, err
+	}
+	threads, err := parsePositiveFormInt(r, "threads", 20)
+	if err != nil {
+		return startRunRequest{}, err
+	}
+	requestsPerConn, err := parsePositiveFormInt(r, "requests_per_conn", 100)
+	if err != nil {
+		return startRunRequest{}, err
+	}
+	seconds, err := parsePositiveFormInt(r, "seconds", 10)
+	if err != nil {
+		return startRunRequest{}, err
+	}
+	headerText := r.FormValue("headers")
+	headerFile := "nil"
+	if strings.TrimSpace(headerText) != "" {
+		headerFile = "inline"
+	}
+	req := startRunRequest{
+		URL:             strings.TrimSpace(r.FormValue("url")),
+		Threads:         threads,
+		RequestsPerConn: requestsPerConn,
+		Method:          strings.ToLower(strings.TrimSpace(r.FormValue("method"))),
+		Seconds:         seconds,
+		HeaderPreset:    normalizeHeaderPreset(strings.TrimSpace(r.FormValue("header_preset")), headerFile),
+		HeaderText:      headerText,
+	}
+	if req.URL == "" {
+		return startRunRequest{}, fmt.Errorf("target url is required")
+	}
+	if req.Method == "" {
+		req.Method = "get"
+	}
+	if req.Method != "get" && req.Method != "post" {
+		return startRunRequest{}, fmt.Errorf("wrong mode, only can use get or post")
+	}
+	return req, nil
+}
+
+func parsePositiveFormInt(r *http.Request, name string, fallback int) (int, error) {
+	value := strings.TrimSpace(r.FormValue(name))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s should be a positive integer", name)
+	}
+	return parsed, nil
+}
+
+func executeStoredRun(run runRecord) {
+	req := startRunRequest{
+		URL:             run.TargetURL,
+		Threads:         run.Threads,
+		RequestsPerConn: run.RequestsPerConn,
+		Method:          run.Method,
+		Seconds:         run.Seconds,
+		HeaderPreset:    run.HeaderPreset,
+		HeaderText:      run.HeaderText,
+	}
+	if err := webStore.MarkRunStarted(run.ID); err != nil {
+		fmt.Println("Failed to mark run started:", err)
+		return
+	}
+	logger := &logBuffer{
+		sink: func(layer, message string) {
+			if err := webStore.AppendLog(run.ID, layer, message); err != nil {
+				fmt.Println("Failed to persist log:", err)
+			}
+		},
+	}
+	logger.Append("run", "run=%d target=%s threads=%d requests_per_conn=%d seconds=%d", run.ID, req.URL, req.Threads, req.RequestsPerConn, req.Seconds)
+
+	headerFile := "nil"
+	if strings.TrimSpace(req.HeaderText) != "" {
+		tmpName := filepath.Join(os.TempDir(), fmt.Sprintf("httpflood-header-%d-%d.txt", run.ID, time.Now().UnixNano()))
+		if err := os.WriteFile(tmpName, []byte(req.HeaderText), 0o600); err != nil {
+			logger.Append("header", "unable to save headers: %v", err)
+			_ = webStore.FinishRun(run.ID, "failed", err.Error())
+			return
+		}
+		defer os.Remove(tmpName)
+		headerFile = tmpName
+	}
+	req.HeaderPreset = normalizeHeaderPreset(req.HeaderPreset, headerFile)
+
+	if err := runFlood(req.URL, req.Threads, req.RequestsPerConn, req.Method, req.Seconds, headerFile, req.HeaderPreset, false, logger); err != nil {
+		logger.Append("run", "failed: %v", err)
+		_ = webStore.FinishRun(run.ID, "failed", err.Error())
+		return
+	}
+	logger.Append("run", "completed")
+	_ = webStore.FinishRun(run.ID, "completed", "")
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		fmt.Println("Failed to write JSON response:", err)
+	}
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
 }
 
 func renderPage(w http.ResponseWriter, data pageData) {

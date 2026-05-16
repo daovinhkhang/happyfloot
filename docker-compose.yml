@@ -7,3 +7,6 @@ services:
     restart: unless-stopped
     environment:
       - GO111MODULE=on
+      - HTTPFLOOD_DB=/data/httpflood.sqlite
+    volumes:
+      - ./data:/data
