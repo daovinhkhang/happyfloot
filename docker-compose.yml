@@ -8,6 +8,6 @@ services:
       - GO111MODULE=on
       - HTTPFLOOD_DB=/data/httpflood.sqlite
       - HTTPFLOOD_ADMIN_USER=admin
-      - HTTPFLOOD_ADMIN_PASS=admin123
+      - HTTPFLOOD_ADMIN_PASS=Khang0834684568
     volumes:
       - ./data:/data
