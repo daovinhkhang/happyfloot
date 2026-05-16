@@ -47,3 +47,44 @@ Or anything else of http header. If you don't have any idea of this please just 
     cd golang-httpflood
     go build httpflood.go
     ./httpflood  <url> <threads> <get/post> <seconds> <header.txt/nil>
+
+## Docker production setup
+
+A production-ready Docker image is now included.
+
+Build the image locally:
+
+    docker build -t golang-httpflood .
+
+Run the container:
+
+    docker run -p 8080:8080 --name golang-httpflood golang-httpflood
+
+Then open:
+
+    http://localhost:8080
+
+If port 8080 is in use, map to another host port:
+
+    docker run -p 8081:8080 --name golang-httpflood golang-httpflood
+
+## Docker Compose
+
+A `docker-compose.yml` is included for convenience:
+
+    docker-compose up --build
+
+This will expose the UI on port 8080 by default.
+
+## VPS deployment
+
+On your VPS, you can deploy from the repo using Docker:
+
+    git clone <repo-url> golang-httpflood
+    cd golang-httpflood
+    docker build -t golang-httpflood .
+    docker run -d -p 8080:8080 --name golang-httpflood golang-httpflood
+
+Then access the service at your VPS public IP on port 8080.
+
+> I cannot connect to your VPS or use SSH credentials directly, but these are the commands you can run on the server.
