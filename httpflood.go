@@ -92,6 +92,7 @@ var (
 	pageTemplate = template.Must(template.New("page").Parse(pageHTML))
 	webStore     *runStore
 	runControls  = newRunControlManager()
+	runStats     = newRunStatsManager()
 )
 
 const pageHTML = `<!DOCTYPE html>
@@ -137,6 +138,10 @@ const pageHTML = `<!DOCTYPE html>
     .run-actions { display:flex; gap:8px; flex-wrap:wrap; }
     .run-actions button { border:1px solid var(--line); border-radius:2px; background:#021107; color:var(--text); padding:8px 10px; font:inherit; cursor:pointer; text-transform:none; }
     .run-actions button:disabled { opacity:.4; cursor:not-allowed; }
+    .telemetry { margin-top:10px; display:grid; gap:8px; grid-template-columns:repeat(4,minmax(0,1fr)); }
+    .metric { border:1px solid var(--line); border-radius:2px; padding:8px; background:#021007; }
+    .metric .k { display:block; color:var(--muted); font-size:.72rem; text-transform:uppercase; margin-bottom:4px; }
+    .metric .v { display:block; color:var(--text); font-size:.95rem; }
     .top-nav { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
     .top-nav a, .top-nav button { border:1px solid var(--line); border-radius:2px; background:#021107; color:var(--text); padding:8px 10px; font:inherit; text-decoration:none; cursor:pointer; }
     .logs { min-height:340px; font-size:.86rem; line-height:1.45; }
@@ -207,6 +212,12 @@ const pageHTML = `<!DOCTYPE html>
         <button id="stop-run" type="button">Stop</button>
         <button id="delete-run" type="button">Delete</button>
       </div>
+      <div class="telemetry">
+        <div class="metric"><span class="k">Req/s (est)</span><span id="metric-rps" class="v">-</span></div>
+        <div class="metric"><span class="k">Total Sent</span><span id="metric-total" class="v">-</span></div>
+        <div class="metric"><span class="k">Active Threads</span><span id="metric-active" class="v">-</span></div>
+        <div class="metric"><span class="k">Error Rate</span><span id="metric-error" class="v">-</span></div>
+      </div>
       <textarea id="logs" class="logs" readonly></textarea>
     </section>
   </main>
@@ -222,11 +233,16 @@ const pageHTML = `<!DOCTYPE html>
     const resumeRunButton = document.getElementById('resume-run');
     const stopRunButton = document.getElementById('stop-run');
     const deleteRunButton = document.getElementById('delete-run');
+    const metricRpsEl = document.getElementById('metric-rps');
+    const metricTotalEl = document.getElementById('metric-total');
+    const metricActiveEl = document.getElementById('metric-active');
+    const metricErrorEl = document.getElementById('metric-error');
     let activeRunId = null;
     let activeRunStatus = '';
     let afterLogId = 0;
     let logLines = [];
     let refreshBusy = false;
+    let lastStatsSample = null;
 
     function setMessage(text, isError) {
       message.textContent = text || '';
@@ -251,6 +267,11 @@ const pageHTML = `<!DOCTYPE html>
       afterLogId = 0;
       logLines = [];
       logsEl.value = '';
+      lastStatsSample = null;
+      metricRpsEl.textContent = '-';
+      metricTotalEl.textContent = '-';
+      metricActiveEl.textContent = '-';
+      metricErrorEl.textContent = '-';
     }
 
     function setRunActionButtons() {
@@ -331,6 +352,35 @@ const pageHTML = `<!DOCTYPE html>
       logsEl.scrollTop = logsEl.scrollHeight;
     }
 
+    async function refreshStats() {
+      if (!activeRunId) {
+        return;
+      }
+      const payload = await api('/api/runs/' + activeRunId + '/stats');
+      const stats = payload.stats || {};
+      const totalSent = Number(stats.total_sent || 0);
+      const connErrors = Number(stats.connection_errors || 0);
+      const writeErrors = Number(stats.write_errors || 0);
+      const activeThreads = Number(stats.active_threads || 0);
+      const nowTs = Date.now();
+      let estRps = Number(stats.avg_rps || 0);
+      if (lastStatsSample && lastStatsSample.runId === activeRunId) {
+        const deltaSent = totalSent - lastStatsSample.totalSent;
+        const deltaSec = (nowTs - lastStatsSample.ts) / 1000;
+        if (deltaSent >= 0 && deltaSec > 0) {
+          estRps = deltaSent / deltaSec;
+        }
+      }
+      lastStatsSample = { runId: activeRunId, totalSent: totalSent, ts: nowTs };
+      const errorRate = (totalSent + connErrors + writeErrors) > 0
+        ? ((connErrors + writeErrors) / (totalSent + connErrors + writeErrors)) * 100
+        : 0;
+      metricRpsEl.textContent = estRps.toFixed(1);
+      metricTotalEl.textContent = totalSent.toLocaleString();
+      metricActiveEl.textContent = activeThreads.toLocaleString();
+      metricErrorEl.textContent = errorRate.toFixed(2) + '%';
+    }
+
     async function refreshRuns() {
       if (refreshBusy) return;
       refreshBusy = true;
@@ -344,7 +394,10 @@ const pageHTML = `<!DOCTYPE html>
           resetLogs();
         }
         renderRuns(runs);
-        if (activeRunId) await refreshLogs();
+        if (activeRunId) {
+          await refreshLogs();
+          await refreshStats();
+        }
         pollState.textContent = 'Updated ' + new Date().toLocaleTimeString();
       } catch (error) {
         pollState.textContent = 'Poll error';
@@ -536,6 +589,90 @@ func (m *runControlManager) Get(runID int64) (*runControl, bool) {
 }
 
 func (m *runControlManager) Delete(runID int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.items, runID)
+}
+
+type runRuntimeStats struct {
+	startedAtUnixNano atomic.Int64
+	totalSent         atomic.Int64
+	connectionErrors  atomic.Int64
+	writeErrors       atomic.Int64
+	activeThreads     atomic.Int64
+}
+
+type runRuntimeStatsSnapshot struct {
+	RunID            int64   `json:"run_id"`
+	ActiveThreads    int64   `json:"active_threads"`
+	TotalSent        int64   `json:"total_sent"`
+	ConnectionErrors int64   `json:"connection_errors"`
+	WriteErrors      int64   `json:"write_errors"`
+	ElapsedSeconds   int64   `json:"elapsed_seconds"`
+	AvgRPS           float64 `json:"avg_rps"`
+	ErrorRate        float64 `json:"error_rate"`
+}
+
+func newRunRuntimeStats() *runRuntimeStats {
+	stats := &runRuntimeStats{}
+	stats.startedAtUnixNano.Store(time.Now().UnixNano())
+	return stats
+}
+
+func (s *runRuntimeStats) Snapshot(runID int64) runRuntimeStatsSnapshot {
+	now := time.Now().UnixNano()
+	started := s.startedAtUnixNano.Load()
+	elapsedSeconds := int64(0)
+	if started > 0 && now > started {
+		elapsedSeconds = int64(time.Duration(now - started).Seconds())
+	}
+	totalSent := s.totalSent.Load()
+	connErrors := s.connectionErrors.Load()
+	writeErrors := s.writeErrors.Load()
+	totalOps := totalSent + connErrors + writeErrors
+	errorRate := 0.0
+	if totalOps > 0 {
+		errorRate = float64(connErrors+writeErrors) / float64(totalOps)
+	}
+	avgRPS := 0.0
+	if elapsedSeconds > 0 {
+		avgRPS = float64(totalSent) / float64(elapsedSeconds)
+	}
+	return runRuntimeStatsSnapshot{
+		RunID:            runID,
+		ActiveThreads:    s.activeThreads.Load(),
+		TotalSent:        totalSent,
+		ConnectionErrors: connErrors,
+		WriteErrors:      writeErrors,
+		ElapsedSeconds:   elapsedSeconds,
+		AvgRPS:           avgRPS,
+		ErrorRate:        errorRate,
+	}
+}
+
+type runStatsManager struct {
+	mu    sync.Mutex
+	items map[int64]*runRuntimeStats
+}
+
+func newRunStatsManager() *runStatsManager {
+	return &runStatsManager{items: make(map[int64]*runRuntimeStats)}
+}
+
+func (m *runStatsManager) Set(runID int64, stats *runRuntimeStats) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.items[runID] = stats
+}
+
+func (m *runStatsManager) Get(runID int64) (*runRuntimeStats, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	stats, ok := m.items[runID]
+	return stats, ok
+}
+
+func (m *runStatsManager) Delete(runID int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.items, runID)
@@ -1101,7 +1238,7 @@ func parseTarget(target string, logger *logBuffer) (string, string, string, stri
 	return runHost, runPort, runPage, runKey, nil
 }
 
-func floodWorker(threadID int, runHost, runPort, runPage, runMode, runKey, headerFile, headerPreset string, requestsPerConn int, ready chan<- int, starter <-chan bool, control *runControl, logger *logBuffer) {
+func floodWorker(threadID int, runHost, runPort, runPage, runMode, runKey, headerFile, headerPreset string, requestsPerConn int, ready chan<- int, starter <-chan bool, control *runControl, stats *runRuntimeStats, logger *logBuffer) {
 	addr := runHost + ":" + runPort
 	headerPreset = normalizeHeaderPreset(headerPreset, headerFile)
 	verboseThreadLog := logger.console
@@ -1118,6 +1255,10 @@ func floodWorker(threadID int, runHost, runPort, runPage, runMode, runKey, heade
 	}
 	ready <- threadID
 	<-starter
+	if stats != nil {
+		stats.activeThreads.Add(1)
+		defer stats.activeThreads.Add(-1)
+	}
 	if verboseThreadLog {
 		logger.Append("thread ready", "thread=%d started", threadID)
 	}
@@ -1167,6 +1308,9 @@ func floodWorker(threadID int, runHost, runPort, runPage, runMode, runKey, heade
 		}
 		if err != nil {
 			connectionErrors++
+			if stats != nil {
+				stats.connectionErrors.Add(1)
+			}
 			if time.Now().After(reportAt) {
 				if verboseThreadLog {
 					logger.Append("progress", "thread=%d batches=%d requests=%d conn_errors=%d write_errors=%d", threadID, successfulBatches, writtenRequests, connectionErrors, writeErrors)
@@ -1210,9 +1354,15 @@ func floodWorker(threadID int, runHost, runPort, runPage, runMode, runKey, heade
 			request += header + "\r\n"
 			if _, err := s.Write([]byte(request)); err != nil {
 				writeErrors++
+				if stats != nil {
+					stats.writeErrors.Add(1)
+				}
 				break
 			}
 			written++
+			if stats != nil {
+				stats.totalSent.Add(1)
+			}
 		}
 		if written > 0 {
 			successfulBatches++
@@ -1232,7 +1382,7 @@ func floodWorker(threadID int, runHost, runPort, runPage, runMode, runKey, heade
 	}
 }
 
-func runFlood(target string, threads int, requestsPerConn int, runMode string, seconds int, headerFile, headerPreset string, waitForEnter bool, control *runControl, logger *logBuffer) error {
+func runFlood(target string, threads int, requestsPerConn int, runMode string, seconds int, headerFile, headerPreset string, waitForEnter bool, control *runControl, stats *runRuntimeStats, logger *logBuffer) error {
 	if runMode != "get" && runMode != "post" {
 		return fmt.Errorf("wrong mode, only can use get or post")
 	}
@@ -1262,7 +1412,7 @@ func runFlood(target string, threads int, requestsPerConn int, runMode string, s
 	ready := make(chan int, threads)
 	for i := 0; i < threads; i++ {
 		time.Sleep(time.Microsecond * 100)
-		go floodWorker(i+1, runHost, runPort, runPage, runMode, runKey, headerFile, headerPreset, requestsPerConn, ready, starter, control, logger)
+		go floodWorker(i+1, runHost, runPort, runPage, runMode, runKey, headerFile, headerPreset, requestsPerConn, ready, starter, control, stats, logger)
 	}
 	for i := 0; i < threads; i++ {
 		threadID := <-ready
@@ -1468,8 +1618,10 @@ func handleRuns(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		control := newRunControl()
+		stats := newRunRuntimeStats()
 		runControls.Set(run.ID, control)
-		go executeStoredRun(run, control)
+		runStats.Set(run.ID, stats)
+		go executeStoredRun(run, control, stats)
 		writeJSON(w, http.StatusAccepted, map[string]interface{}{"run": run})
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -1532,7 +1684,40 @@ func handleRunResource(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		runControls.Delete(runID)
+		runStats.Delete(runID)
 		writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": run.ID})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "stats" && r.Method == http.MethodGet {
+		run, err := webStore.GetRun(runID)
+		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		stats, exists := runStats.Get(runID)
+		if !exists {
+			snapshot := runRuntimeStatsSnapshot{RunID: runID}
+			if run.StartedAt != "" {
+				if startedAt, parseErr := time.Parse(time.RFC3339, run.StartedAt); parseErr == nil {
+					endAt := time.Now()
+					if run.CompletedAt != "" {
+						if completedAt, parseCompletedErr := time.Parse(time.RFC3339, run.CompletedAt); parseCompletedErr == nil {
+							endAt = completedAt
+						}
+					}
+					if endAt.After(startedAt) {
+						snapshot.ElapsedSeconds = int64(endAt.Sub(startedAt).Seconds())
+					}
+				}
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"stats": snapshot})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"stats": stats.Snapshot(runID)})
 		return
 	}
 	if len(parts) == 2 && r.Method == http.MethodPost {
@@ -1671,7 +1856,7 @@ func parsePositiveFormInt(r *http.Request, name string, fallback int) (int, erro
 	return parsed, nil
 }
 
-func executeStoredRun(run runRecord, control *runControl) {
+func executeStoredRun(run runRecord, control *runControl, stats *runRuntimeStats) {
 	req := startRunRequest{
 		URL:             run.TargetURL,
 		Threads:         run.Threads,
@@ -1684,6 +1869,7 @@ func executeStoredRun(run runRecord, control *runControl) {
 	if err := webStore.MarkRunStarted(run.ID); err != nil {
 		fmt.Println("Failed to mark run started:", err)
 		runControls.Delete(run.ID)
+		runStats.Delete(run.ID)
 		return
 	}
 	defer runControls.Delete(run.ID)
@@ -1727,7 +1913,7 @@ func executeStoredRun(run runRecord, control *runControl) {
 	}
 	req.HeaderPreset = normalizeHeaderPreset(req.HeaderPreset, headerFile)
 
-	if err := runFlood(req.URL, req.Threads, req.RequestsPerConn, req.Method, req.Seconds, headerFile, req.HeaderPreset, false, control, logger); err != nil {
+	if err := runFlood(req.URL, req.Threads, req.RequestsPerConn, req.Method, req.Seconds, headerFile, req.HeaderPreset, false, control, stats, logger); err != nil {
 		if droppedLogs.Load() > 0 {
 			_ = webStore.AppendLog(run.ID, "log", fmt.Sprintf("dropped_logs=%d due to HTTPFLOOD_MAX_LOGS_PER_RUN=%d", droppedLogs.Load(), maxLogs))
 		}
@@ -1806,7 +1992,7 @@ func main() {
 	if os.Args[5] != "nil" {
 		cliPreset = "custom"
 	}
-	if err := runFlood(os.Args[1], threads, 100, os.Args[3], limit, os.Args[5], cliPreset, true, nil, logger); err != nil {
+	if err := runFlood(os.Args[1], threads, 100, os.Args[3], limit, os.Args[5], cliPreset, true, nil, nil, logger); err != nil {
 		fmt.Println("Error:", err)
 		os.Exit(1)
 	}
