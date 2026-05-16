@@ -84,6 +84,22 @@ Optional web UI environment variables:
 
     HTTPFLOOD_DB=/path/to/httpflood.sqlite
     HTTPFLOOD_ADDR=:8080
+    HTTPFLOOD_ADMIN_USER=admin
+    HTTPFLOOD_ADMIN_PASS=admin123
+
+## Authentication and account management
+
+- Web UI now requires login (`/login`).
+- On first startup, if no admin exists in SQLite, the app creates exactly one
+  admin account from `HTTPFLOOD_ADMIN_USER` and `HTTPFLOOD_ADMIN_PASS`.
+- Only admin can open `/accounts` to create and manage other accounts.
+- Managed accounts are `member` role only. Admin role is unique and not created
+  from UI.
+- Account permissions:
+  - `can_start_run`: can create flood runs.
+  - `can_view_monitor`: can view VPS metrics page.
+- Realtime monitor page is available at `/monitor` and updates without full page
+  reload.
 
 ## VPS deployment
 

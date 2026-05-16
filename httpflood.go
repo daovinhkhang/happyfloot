@@ -130,6 +130,8 @@ const pageHTML = `<!DOCTYPE html>
     .status-completed { color:#8eff9a; border-color:#8eff9a; }
     .status-failed, .status-interrupted { color:#ff9b9b; border-color:#b14a4a; }
     .log-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; color:var(--muted); font-size:.82rem; }
+    .top-nav { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .top-nav a, .top-nav button { border:1px solid var(--line); border-radius:2px; background:#021107; color:var(--text); padding:8px 10px; font:inherit; text-decoration:none; cursor:pointer; }
     .logs { min-height:340px; font-size:.86rem; line-height:1.45; }
     @media (max-width:720px) { .grid { grid-template-columns:1fr; } body { padding:8px; } .card { padding:10px; } .logs { min-height:240px; } .run-row { align-items:flex-start; flex-direction:column; } }
   </style>
@@ -139,6 +141,11 @@ const pageHTML = `<!DOCTYPE html>
     <section class="card">
       <h1>httpflood</h1>
       <p>terminal web ui / legacy config only</p>
+      <div class="top-nav">
+        <a href="/monitor">Monitor</a>
+        <a href="/accounts">Accounts</a>
+        <button id="logout-button" type="button">Logout</button>
+      </div>
     </section>
     <section class="card">
       <h2>Start</h2>
@@ -311,7 +318,7 @@ const pageHTML = `<!DOCTYPE html>
       startButton.disabled = true;
       setMessage('Starting run...', false);
       try {
-        const payload = await api('/api/runs', { method: 'POST', body: new FormData(form) });
+        const payload = await api('/api/runs', { method: 'POST', body: new URLSearchParams(new FormData(form)) });
         activeRunId = payload.run.id;
         resetLogs();
         setMessage('Started run #' + activeRunId, false);
@@ -325,6 +332,12 @@ const pageHTML = `<!DOCTYPE html>
 
     refreshRuns();
     window.setInterval(refreshRuns, 1500);
+
+    const logoutButton = document.getElementById('logout-button');
+    logoutButton.addEventListener('click', async function () {
+      await fetch('/api/logout', { method: 'POST' });
+      window.location.href = '/login';
+    });
   </script>
 </body>
 </html>`
@@ -463,8 +476,32 @@ func (s *runStore) init() error {
 			created_at TEXT NOT NULL,
 			FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
 		)`,
+		`CREATE TABLE IF NOT EXISTS users (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			username TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL,
+			role TEXT NOT NULL,
+			can_start_run INTEGER NOT NULL DEFAULT 1,
+			can_view_monitor INTEGER NOT NULL DEFAULT 1,
+			is_active INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			created_by INTEGER,
+			FOREIGN KEY(created_by) REFERENCES users(id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS sessions (
+			id TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL,
+			expires_at TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			last_seen_at TEXT NOT NULL,
+			FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
 		"CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)",
 		"CREATE INDEX IF NOT EXISTS idx_run_logs_run_id_id ON run_logs(run_id, id)",
+		"CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)",
+		"CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)",
+		"CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)",
 	} {
 		if _, err := s.db.Exec(query); err != nil {
 			return err
@@ -1007,11 +1044,25 @@ func startWebServer() {
 	}
 	defer store.Close()
 	webStore = store
+	if err := webStore.ensureSingleAdmin(); err != nil {
+		fmt.Println("Failed to initialize admin account:", err)
+		return
+	}
+	webStore.purgeExpiredSessions()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleIndex)
+	mux.HandleFunc("/login", handleLoginPage)
+	mux.HandleFunc("/monitor", handleMonitorPage)
+	mux.HandleFunc("/accounts", handleAccountsPage)
+	mux.HandleFunc("/api/login", handleLoginAPI)
+	mux.HandleFunc("/api/logout", handleLogoutAPI)
+	mux.HandleFunc("/api/me", handleMeAPI)
 	mux.HandleFunc("/api/runs", handleRuns)
 	mux.HandleFunc("/api/runs/", handleRunResource)
+	mux.HandleFunc("/api/accounts", handleAccountsAPI)
+	mux.HandleFunc("/api/accounts/", handleAccountResourceAPI)
+	mux.HandleFunc("/api/system/metrics", handleMonitorMetricsAPI)
 
 	listenAddr := webListenAddr()
 	fmt.Println("Starting httpflood UI on", listenAddr)
@@ -1026,6 +1077,9 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if _, ok := requireAuthPage(w, r); !ok {
+		return
+	}
 	data := pageData{Method: "get", HeaderPreset: "default"}
 	renderPage(w, data)
 }
@@ -1033,6 +1087,10 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 func handleRuns(w http.ResponseWriter, r *http.Request) {
 	if webStore == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "SQLite store is not ready")
+		return
+	}
+	user, ok := requireAuthAPI(w, r)
+	if !ok {
 		return
 	}
 	switch r.Method {
@@ -1044,6 +1102,10 @@ func handleRuns(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"runs": runs})
 	case http.MethodPost:
+		if !user.CanStartRun && !isAdmin(user) {
+			writeJSONError(w, http.StatusForbidden, "run creation denied by account permission")
+			return
+		}
 		req, err := parseStartRunRequest(r)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -1065,6 +1127,9 @@ func handleRuns(w http.ResponseWriter, r *http.Request) {
 func handleRunResource(w http.ResponseWriter, r *http.Request) {
 	if webStore == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "SQLite store is not ready")
+		return
+	}
+	if _, ok := requireAuthAPI(w, r); !ok {
 		return
 	}
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/runs/"), "/")
@@ -1105,7 +1170,7 @@ func handleRunResource(w http.ResponseWriter, r *http.Request) {
 }
 
 func parseStartRunRequest(r *http.Request) (startRunRequest, error) {
-	if err := r.ParseForm(); err != nil {
+	if err := parseWebForm(r); err != nil {
 		return startRunRequest{}, err
 	}
 	threads, err := parsePositiveFormInt(r, "threads", 20)
@@ -1144,6 +1209,14 @@ func parseStartRunRequest(r *http.Request) (startRunRequest, error) {
 		return startRunRequest{}, fmt.Errorf("wrong mode, only can use get or post")
 	}
 	return req, nil
+}
+
+func parseWebForm(r *http.Request) error {
+	contentType := r.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		return r.ParseMultipartForm(4 << 20)
+	}
+	return r.ParseForm()
 }
 
 func parsePositiveFormInt(r *http.Request, name string, fallback int) (int, error) {

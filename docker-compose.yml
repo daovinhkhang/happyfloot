@@ -1,4 +1,3 @@
-version: '3.9'
 services:
   httpflood:
     build: .
@@ -8,5 +7,7 @@ services:
     environment:
       - GO111MODULE=on
       - HTTPFLOOD_DB=/data/httpflood.sqlite
+      - HTTPFLOOD_ADMIN_USER=admin
+      - HTTPFLOOD_ADMIN_PASS=admin123
     volumes:
       - ./data:/data
