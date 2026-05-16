@@ -120,6 +120,9 @@ Optional web UI environment variables:
   - `POST /api/runs/{id}/resume`
   - `POST /api/runs/{id}/stop`
   - `DELETE /api/runs/{id}`
+- Realtime run telemetry is available in UI and API:
+  - UI shows estimated `req/s`, `total sent`, `active threads`, `error rate`
+  - `GET /api/runs/{id}/stats`
 
 ## VPS deployment
 
